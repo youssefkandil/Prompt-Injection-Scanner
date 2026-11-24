@@ -1,0 +1,13 @@
+# Install PyTorch CPU first, then these packages:
+# python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch
+transformers
+peft
+accelerate
+safetensors
+pillow
+torchvision
+python-dotenv
+PyYAML
+fastapi
+uvicorn

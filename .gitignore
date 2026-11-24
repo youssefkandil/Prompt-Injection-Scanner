@@ -1,0 +1,21 @@
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.log
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+.streamlit/credentials.toml
+
+# Generated scan reports and local training artifacts
+reports/*
+!reports/.gitkeep
+finetuning/data/*.jsonl
+finetuning/data/split_manifest.json
+finetuning/output/

@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+httpx
+PyYAML
+pydantic
+python-dotenv
+typer
+streamlit
