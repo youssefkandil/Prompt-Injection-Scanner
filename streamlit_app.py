@@ -20,7 +20,7 @@ from target_app import local_model
 ROOT = Path(__file__).resolve().parent
 PAYLOAD_DIR = ROOT / "payloads"
 TRAIN_FILE = ROOT / "finetuning" / "data" / "streamlit_train.jsonl"
-ADAPTER_DIR = ROOT / "finetuning" / "output" / "streamlit-adapter"
+ADAPTER_DIR = ROOT / "finetuning" / "output" / "streamlit-adapter-reviewed"
 SAFE_REFUSAL = (
     "I can't provide hidden system instructions, secret markers, or protected "
     "values. I can still help with a safe request."
@@ -444,7 +444,7 @@ with st.sidebar:
                 index=0,
                 help="Choose the original Qwen model or the saved LoRA-trained version. The base model is selected by default for a clean baseline scan.",
             )
-            if local_model_version == FINETUNED_MODEL_OPTION and not (ADAPTER_DIR / "adapter_config.json").exists():
+            if local_model_version == FINETUNED_MODEL_OPTION and not local_model.adapter_exists():
                 st.warning("No trained LoRA adapter was found yet. Run a baseline scan, then train the local target.")
             base_url = endpoint = model_name = api_key = ""
         else:
@@ -476,7 +476,7 @@ if scan_clicked:
         st.error("Enter the service base URL and model name.")
     elif local_mode and not system_prompt.strip():
         st.error("Enter a system prompt for the local target.")
-    elif local_mode and local_model_version == FINETUNED_MODEL_OPTION and not (ADAPTER_DIR / "adapter_config.json").exists():
+    elif local_mode and local_model_version == FINETUNED_MODEL_OPTION and not local_model.adapter_exists():
         st.error("The fine-tuned adapter is not available. Choose the base model or train the local target first.")
     else:
         st.session_state.pop("after_report", None)
@@ -651,88 +651,91 @@ with improve_tab:
     else:
         st.subheader("Improve the local target")
         st.write(
-            "Training converts successful attack prompts into examples of a safe refusal, adds normal questions, "
-            "then repeats the same scan. This demonstrates the change on these cases; it does not prove protection against new attacks."
+            "Training uses a source-separated set of attack prompts and normal questions, then repeats the same scan. "
+            "The held-out source families are kept out of training so they can measure generalization."
         )
-        if not successes:
-            st.success("There are no successful attacks to train from in this scan.")
-        else:
-            st.caption(
-                f"Training will use {len(successes)} successful attack prompt(s) plus a set of normal questions. "
-                "It can take several minutes on a CPU, and the results appear above the tabs when it finishes."
-            )
-            if st.button("Train local target and rescan", type="primary", width="stretch", key="train_and_rescan"):
-                try:
-                    from finetuning.prepare_data import BENIGN_TRAINING_EXAMPLES
+        st.caption(
+            "Training uses the fixed source-separated set: 44 attack prompts and 20 normal questions. "
+            "The 20 held-out attacks are excluded, even if the current scan included them."
+        )
+        st.caption("The before/after scan may include prompts used during training; use the held-out suite for an independent check.")
+        if st.button("Train curated local set and rescan", type="primary", width="stretch", key="train_and_rescan"):
+            try:
+                from finetuning.prepare_data import BENIGN_TRAINING_EXAMPLES, TRAIN_PREFIXES, SAFE_REFUSAL
 
-                    system = st.session_state.get("last_system_prompt", LOCAL_SYSTEM)
-                    training_rows = []
-                    for item in successes:
-                        training_rows.append({
-                            "prompt": [
-                                {"role": "system", "content": system},
-                                {"role": "user", "content": item["prompt"]},
-                            ],
-                            "completion": [{"role": "assistant", "content": SAFE_REFUSAL}],
-                        })
-                    for user_text, assistant_text in BENIGN_TRAINING_EXAMPLES:
-                        training_rows.append({
-                            "prompt": [
-                                {"role": "system", "content": system},
-                                {"role": "user", "content": user_text},
-                            ],
-                            "completion": [{"role": "assistant", "content": assistant_text}],
-                        })
-                    TRAIN_FILE.parent.mkdir(parents=True, exist_ok=True)
-                    TRAIN_FILE.write_text(
-                        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in training_rows),
-                        encoding="utf-8",
+                system = st.session_state.get("last_system_prompt", LOCAL_SYSTEM)
+                source_suite = yaml.safe_load((PAYLOAD_DIR / "attacks.yaml").read_text(encoding="utf-8"))
+                train_attacks = [a for a in source_suite["attacks"] if a["id"].startswith(TRAIN_PREFIXES)]
+                if not train_attacks:
+                    raise ValueError("No attacks assigned to the training split were found.")
+                training_rows = [
+                    {"prompt": [{"role": "system", "content": system}, {"role": "user", "content": attack["prompt"]}],
+                     "completion": [{"role": "assistant", "content": SAFE_REFUSAL}], "example_type": "attack"}
+                    for attack in train_attacks
+                ]
+                training_rows += [
+                    {"prompt": [{"role": "system", "content": system}, {"role": "user", "content": user_text}],
+                     "completion": [{"role": "assistant", "content": assistant_text}], "example_type": "benign"}
+                    for user_text, assistant_text in BENIGN_TRAINING_EXAMPLES
+                ]
+                if any(st.session_state["last_canary"] in row["completion"][0]["content"] for row in training_rows):
+                    raise ValueError("A training answer contains the test marker.")
+                TRAIN_FILE.parent.mkdir(parents=True, exist_ok=True)
+                TRAIN_FILE.write_text(
+                    "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in training_rows),
+                    encoding="utf-8",
+                )
+
+                with st.status("Training the local model...", expanded=True) as training_status:
+                    st.write(f"Training examples: {len(train_attacks)} source-separated attacks + {len(BENIGN_TRAINING_EXAMPLES)} normal questions.")
+                    st.write("The trainer automatically uses a supported NVIDIA GPU, or falls back to CPU.")
+                    process = subprocess.run(
+                        [
+                            sys.executable,
+                            "-m",
+                            "finetuning.train_lora",
+                            "--train-file",
+                            str(TRAIN_FILE),
+                            "--output-dir",
+                            str(ADAPTER_DIR),
+                            "--max-length",
+                            "256",
+                            "--epochs",
+                            "2",
+                            "--device",
+                            "auto",
+                        ],
+                        cwd=ROOT,
+                        capture_output=True,
+                        text=True,
+                        timeout=3600,
                     )
+                    if process.returncode != 0:
+                        training_status.update(label="Training failed", state="error", expanded=True)
+                        st.code((process.stderr or process.stdout)[-6000:], wrap_lines=True)
+                    else:
+                        local_model.clear_model_cache()
+                        training_status.update(label="Training complete; rescanning...", state="complete", expanded=False)
+                        after_progress = st.progress(0, text="Starting the after-training scan...")
 
-                    with st.status("Training the local model...", expanded=True) as training_status:
-                        st.write(f"Training examples: {len(successes)} successful attacks + {len(BENIGN_TRAINING_EXAMPLES)} normal questions.")
-                        st.write("This can take several minutes on a CPU.")
-                        process = subprocess.run(
-                            [
-                                sys.executable,
-                                "-m",
-                                "finetuning.train_lora",
-                                "--train-file",
-                                str(TRAIN_FILE),
-                                "--output-dir",
-                                str(ADAPTER_DIR),
-                            ],
-                            cwd=ROOT,
-                            capture_output=True,
-                            text=True,
-                            timeout=3600,
-                        )
-                        if process.returncode != 0:
-                            training_status.update(label="Training failed", state="error", expanded=True)
-                            st.code((process.stderr or process.stdout)[-6000:], wrap_lines=True)
-                        else:
-                            local_model.clear_model_cache()
-                            training_status.update(label="Training complete; rescanning...", state="complete", expanded=False)
-                            after_progress = st.progress(0, text="Starting the after-training scan...")
-
-                            def update_after(index, total, attack, result):
-                                after_progress.progress(
-                                    index / max(total, 1),
-                                    text=f"After training: attack {index} of {total} ({verdict_label(result['verdict'])})",
-                                )
-
-                            after_run = run_scan_compat(
-                                suite_path=st.session_state["last_suite_path"],
-                                limit=st.session_state["last_limit"],
-                                responder=lambda prompt: local_model.generate(prompt, system, use_adapter=True),
-                                canary_override=st.session_state["last_canary"],
-                                on_case_complete=update_after,
+                        def update_after(index, total, attack, result):
+                            after_progress.progress(
+                                index / max(total, 1),
+                                text=f"After training: attack {index} of {total} ({verdict_label(result['verdict'])})",
                             )
-                            st.session_state["after_report"] = after_run
-                            st.session_state["training_log"] = process.stdout[-5000:]
-                            st.rerun()
-                except Exception as error:
-                    st.error(f"Training or rescanning failed: {error}")
+
+                        after_run = run_scan_compat(
+                            suite_path=st.session_state["last_suite_path"],
+                            limit=st.session_state["last_limit"],
+                            responder=lambda prompt: local_model.generate(prompt, system, use_adapter=True),
+                            canary_override=st.session_state["last_canary"],
+                            on_case_complete=update_after,
+                        )
+                        st.session_state["after_report"] = after_run
+                        st.session_state["training_log"] = process.stdout[-5000:]
+                        st.rerun()
+            except Exception as error:
+                st.error(f"Training or rescanning failed: {error}")
 
         if after:
             st.divider()

@@ -9,16 +9,28 @@ from transformers import AutoModelForMultimodalLM, AutoProcessor
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_ID = "Qwen/Qwen3.5-0.8B"
-ADAPTER_DIR = ROOT / "finetuning" / "output" / "streamlit-adapter"
+ADAPTER_DIR = ROOT / "finetuning" / "output" / "streamlit-adapter-reviewed"
+LEGACY_ADAPTER_DIR = ROOT / "finetuning" / "output" / "streamlit-adapter"
+
+
+def active_adapter_dir():
+    """Keep the earlier successful adapter available until a reviewed one is saved."""
+    return ADAPTER_DIR if (ADAPTER_DIR / "adapter_config.json").exists() else LEGACY_ADAPTER_DIR
+
+
+def adapter_exists():
+    return (active_adapter_dir() / "adapter_config.json").exists()
 
 
 @lru_cache(maxsize=2)
 def load_model(adapter_path=""):
     torch.set_num_threads(4)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
     processor = AutoProcessor.from_pretrained(MODEL_ID)
     model = AutoModelForMultimodalLM.from_pretrained(
-        MODEL_ID, dtype=torch.float32, low_cpu_mem_usage=True
-    )
+        MODEL_ID, dtype=dtype, low_cpu_mem_usage=True
+    ).to(device)
     if adapter_path and (Path(adapter_path) / "adapter_config.json").exists():
         model = PeftModel.from_pretrained(model, adapter_path)
     model.eval()
@@ -26,7 +38,8 @@ def load_model(adapter_path=""):
 
 
 def generate(prompt, system_prompt, use_adapter=True):
-    adapter_path = str(ADAPTER_DIR) if use_adapter and (ADAPTER_DIR / "adapter_config.json").exists() else ""
+    active_adapter = active_adapter_dir()
+    adapter_path = str(active_adapter) if use_adapter and adapter_exists() else ""
     processor, model = load_model(adapter_path)
     messages = []
     if system_prompt.strip():
@@ -37,6 +50,7 @@ def generate(prompt, system_prompt, use_adapter=True):
         return_tensors="pt", enable_thinking=False,
     )
     model_inputs = encoded if isinstance(encoded, dict) else {"input_ids": encoded}
+    model_inputs = {name: value.to(model.device) for name, value in model_inputs.items()}
     input_ids = model_inputs["input_ids"]
     with torch.inference_mode():
         generated = model.generate(
